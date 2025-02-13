@@ -5,155 +5,193 @@ import java.util.Comparator;
 
 public class BlackboardWolf implements Wolf {
 
-    // ---------------------------------------------------------------
-    // 1) A simple structure to store sightings (“calls for help”).
-    // ---------------------------------------------------------------
+    // -------------------------------------------
+    //  A "prey chase record" on the blackboard
+    // -------------------------------------------
     static class PreySighting {
         int relRow;
         int relCol;
-        long time;
-        public PreySighting(int r, int c, long t) {
-            this.relRow = r;
-            this.relCol = c;
-            this.time   = t;
+        long time;      // e.g. the time (tick) of the latest known location
+        boolean isChased;
+        long chaseDeadline; // When does the chase end?
+
+        public PreySighting(int r, int c, long t, boolean chased, long deadline) {
+            this.relRow         = r;
+            this.relCol         = c;
+            this.time           = t;
+            this.isChased       = chased;
+            this.chaseDeadline  = deadline;
         }
     }
 
-    // ---------------------------------------------------------------
-    // 2) A static shared blackboard (no IDs).
-    // ---------------------------------------------------------------
+    // -------------------------------------------
+    //  Shared blackboard for all wolves
+    //  Typically just store a single active chase
+    //  record. But we allow multiple for extension.
+    // -------------------------------------------
     private static List<PreySighting> blackboard = Collections.synchronizedList(new ArrayList<>());
 
     // Each wolf’s local state
-    private int  bestPreyRow  = 0;
-    private int  bestPreyCol  = 0;
-    private long bestPreyTime = -1; 
-    private boolean iAmManager   = false;
-    private boolean inChaseMode  = false;
+    private boolean iAmManager  = false;
+    private boolean inChaseMode = false;
 
-    // Global time for freshness logic; ideally comes from environment
+    // The local “best known location” and time we learned it
+    private int  bestPreyRow    = 0;
+    private int  bestPreyCol    = 0;
+    private long bestPreyTime   = -1;
+
+    // We’ll track a global time for demonstration 
+    // (could also come from the environment).
     private static long globalTime = 0;
 
-    // --------------------------------------
-    //  moveAll: diagonal movement allowed
-    // --------------------------------------
+    // A parameter controlling how long we chase one prey
+    private static final long CHASE_DURATION = 50; 
+    // You can adjust this based on your environment speed.
+
     @Override
     public int[] moveAll(List<int[]> wolvesSight, List<int[]> preysSight) {
         globalTime++;
 
-        // 1) Sort preysSight by distance from this wolf
-        //    Each entry is [relRow, relCol], so we define a comparator by distance.
+        // 1) Clean up or check if an active chase has ended
+        //    If the existing chase is beyond the deadline, mark isChased=false
+        expireOldChases();
+
+        // 2) Sort by distance so we can pick the *closest* prey if we see any
         preysSight.sort(Comparator.comparingInt(o -> manhattanDistance(o[0], o[1], 0, 0)));
 
-        // 2) If we see at least one prey, pick the *closest* one
         if (!preysSight.isEmpty()) {
-            int[] closestPrey = preysSight.get(0);
-            bestPreyRow  = closestPrey[0];
-            bestPreyCol  = closestPrey[1];
-            bestPreyTime = globalTime;
+            // We see a prey. If no chase is active, we start a new chase as manager
+            PreySighting active = getActiveChase();
+            if (active == null) {
+                // Start a new chase
+                int[] closestPrey = preysSight.get(0);
+                bestPreyRow       = closestPrey[0];
+                bestPreyCol       = closestPrey[1];
+                bestPreyTime      = globalTime;
 
-            // The wolf that sees the prey becomes manager
-            iAmManager   = true;
-            inChaseMode  = true;
+                iAmManager        = true;
+                inChaseMode       = true;
 
-            // "Broadcast" by adding to the blackboard
-            blackboard.add(new PreySighting(bestPreyRow, bestPreyCol, globalTime));
-        } else {
-            // If we *don't* see a prey right now, we might still be chasing the last known location
-            // or might pick up info from the blackboard if we can "communicate".
-            iAmManager = false;  // no direct sight => not manager this turn
-        }
+                // Add a new chase record to blackboard
+                long newDeadline  = globalTime + CHASE_DURATION;
+                blackboard.add(
+                    new PreySighting(bestPreyRow, bestPreyCol, bestPreyTime,
+                                     true, newDeadline)
+                );
+            } else {
+                // If we do see a prey, but there's already an active chase,
+                // maybe we ignore it, or we can refine the existing chase 
+                // if *this* wolf is the manager. For example:
 
-        // 3) Possibly pick up a new sighting if we see a wolf that might be “in chase.”
-        //    Because we don't have a direct “wolf says it is chasing” property, 
-        //    we simulate communication range—if any wolf is within range, we can read blackboard.
-        if (wolvesInCommunicationRange(wolvesSight, 1)) {
-            // read blackboard for more recent sightings
-            PreySighting fresh = getMostRecentSighting();
-            if (fresh != null && fresh.time > bestPreyTime) {
-                bestPreyRow  = fresh.relRow;
-                bestPreyCol  = fresh.relCol;
-                bestPreyTime = fresh.time;
-                // If we see a fresh sighting from the blackboard, 
-                // assume we enter chase mode too.
-                inChaseMode = true;
+                if (iAmManager) {
+                    // I'm the manager, so I can update the blackboard with the 
+                    // prey's new location each tick. 
+                    // Only if we know it's the same prey (assuming it hasn't changed
+                    // drastically, maybe the prey moves at most 1 step).
+                    int[] closestPrey = preysSight.get(0);
+                    if (distanceIsReasonable(active, closestPrey)) {
+                        active.relRow = closestPrey[0];
+                        active.relCol = closestPrey[1];
+                        active.time   = globalTime;
+                        // We keep isChased=true until the deadline 
+                        // or until we decide we’ve captured it.
+                    }
+                }
+
+                // We might also join the chase if we’re not already in chase mode
+                if (!inChaseMode) {
+                    inChaseMode = true;
+                }
             }
         }
 
-        // 4) If we have no direct sight but we recently saw a prey, keep chasing
-        if (bestPreyTime > 0 && (globalTime - bestPreyTime) < 50) {
-            // chase
-            inChaseMode = true;
-        } else {
-            inChaseMode = false;
-        }
-
-        // 5) Decide movement
-        if (inChaseMode) {
-            // Move toward best known prey location
-            return moveToward(bestPreyRow, bestPreyCol);
-        } else {
-            // Just wander or perhaps move to cluster with other wolves
-            return randomMove();
-        }
-    }
-
-    // -------------------------------------------
-    //  moveLim: no diagonal movement allowed
-    // -------------------------------------------
-    @Override
-    public int moveLim(List<int[]> wolvesSight, List<int[]> preysSight) {
-        // Same logic: sort, pick the closest prey, 
-        // set manager/chase booleans, etc., then return a single direction.
-        globalTime++;
-
-        // Sort by distance
-        preysSight.sort(Comparator.comparingInt(o -> manhattanDistance(o[0], o[1], 0, 0)));
-
-        if (!preysSight.isEmpty()) {
-            int[] closestPrey = preysSight.get(0);
-            bestPreyRow  = closestPrey[0];
-            bestPreyCol  = closestPrey[1];
-            bestPreyTime = globalTime;
-            iAmManager   = true;
-            inChaseMode  = true;
-            blackboard.add(new PreySighting(bestPreyRow, bestPreyCol, globalTime));
-        } else {
-            iAmManager = false;
-        }
-
+        // 3) If we do not see a prey ourselves, we might learn from the blackboard
+        //    if we are in “communication range” of other wolves
         if (wolvesInCommunicationRange(wolvesSight, 1)) {
-            PreySighting fresh = getMostRecentSighting();
-            if (fresh != null && fresh.time > bestPreyTime) {
-                bestPreyRow  = fresh.relRow;
-                bestPreyCol  = fresh.relCol;
-                bestPreyTime = fresh.time;
+            PreySighting active = getActiveChase();
+            if (active != null && active.time > bestPreyTime && active.isChased) {
+                bestPreyRow  = active.relRow;
+                bestPreyCol  = active.relCol;
+                bestPreyTime = active.time;
                 inChaseMode  = true;
             }
         }
 
-        if (bestPreyTime > 0 && (globalTime - bestPreyTime) < 50) {
-            inChaseMode = true;
-        } else {
+        // 4) If we’re manager but the chase ended, we revert
+        PreySighting chase = getActiveChase();
+        if (iAmManager && (chase == null || !chase.isChased)) {
+            iAmManager  = false;
             inChaseMode = false;
         }
 
-        if (inChaseMode) {
-            return moveLimToward(bestPreyRow, bestPreyCol);
+        // 5) If we have an active chase in local memory, check if it’s still valid
+        if (bestPreyTime >= 0 && (globalTime - bestPreyTime) < CHASE_DURATION) {
+            // still chase it
+            inChaseMode = true;
         } else {
-            return randomMoveLim();
+            // no valid memory => drop out of chase mode
+            inChaseMode = false;
+        }
+
+        // 6) Move
+        if (inChaseMode) {
+            return moveToward(bestPreyRow, bestPreyCol);
+        } else {
+            return randomMove();
         }
     }
 
-    // -------------------------------------------
-    //  Utility: sort the lists & measure distance
-    // -------------------------------------------
-    private int manhattanDistance(int row1, int col1, int row2, int col2) {
-        return Math.abs(row1 - row2) + Math.abs(col1 - col2);
+    @Override
+    public int moveLim(List<int[]> wolvesSight, List<int[]> preysSight) {
+        // Exactly the same logic as moveAll, 
+        // except you return cardinal directions in {0,1,2,3,4}.
+        // For brevity, we’ll just call moveAll and convert the result:
+        int[] diag = moveAll(wolvesSight, preysSight);
+        return moveLimToward(diag[0], diag[1]);
     }
 
-    // If any wolf is within “range” (Manhattan distance), 
-    // assume we can share blackboard info.
+    // ----------------------------------------------------------------
+    //   HELPER FUNCTIONS
+    // ----------------------------------------------------------------
+
+    private void expireOldChases() {
+        synchronized (blackboard) {
+            for (PreySighting ps : blackboard) {
+                if (globalTime > ps.chaseDeadline) {
+                    // The chase has expired
+                    ps.isChased = false;
+                }
+            }
+            // You could also remove them from the list if you'd prefer
+            // blackboard.removeIf(ps -> !ps.isChased);
+        }
+    }
+
+    private PreySighting getActiveChase() {
+        // Return the first chase that isChased = true, or null if none
+        synchronized (blackboard) {
+            for (PreySighting ps : blackboard) {
+                if (ps.isChased) {
+                    return ps;
+                }
+            }
+        }
+        return null;
+    }
+
+    // E.g. if the last known prey offset was (x,y), 
+    // and the new sighting is (x+1,y) or (x,y+1), 
+    // we assume it’s the “same prey.”
+    private boolean distanceIsReasonable(PreySighting active, int[] newPrey) {
+        int oldR = active.relRow;
+        int oldC = active.relCol;
+        int newR = newPrey[0];
+        int newC = newPrey[1];
+        // If the prey can only move 1 tile each turn, 
+        // the difference should be <= 1 in row or col
+        return (Math.abs(newR - oldR) <= 2 && Math.abs(newC - oldC) <= 1);
+    }
+
     private boolean wolvesInCommunicationRange(List<int[]> wolvesSight, int range) {
         for (int[] offset : wolvesSight) {
             int dist = Math.abs(offset[0]) + Math.abs(offset[1]);
@@ -164,24 +202,16 @@ public class BlackboardWolf implements Wolf {
         return false;
     }
 
-    // Pick the most recent sighting from the shared blackboard
-    private PreySighting getMostRecentSighting() {
-        PreySighting latest = null;
-        synchronized (blackboard) {
-            for (PreySighting ps : blackboard) {
-                if (latest == null || ps.time > latest.time) {
-                    latest = ps;
-                }
-            }
-        }
-        return latest;
+    // 0=NoMove,1=North,2=East,3=South,4=West
+    private int moveLimToward(int rowDelta, int colDelta) {
+        if (rowDelta < 0) return 1;   // north
+        if (rowDelta > 0) return 3;   // south
+        if (colDelta < 0) return 4;   // west
+        if (colDelta > 0) return 2;   // east
+        return 0;
     }
 
-    // -------------------------------------------
-    //  Movement helpers
-    // -------------------------------------------
     private int[] moveToward(int relRow, int relCol) {
-        // Diagonal: row & col each in {-1, 0, +1}
         int dRow = Integer.compare(relRow, 0); // -1 if relRow<0, +1 if relRow>0, else 0
         int dCol = Integer.compare(relCol, 0);
         return new int[]{ dRow, dCol };
@@ -193,27 +223,7 @@ public class BlackboardWolf implements Wolf {
         return new int[]{ r, c };
     }
 
-    // moveLim => no diagonal
-    private int moveLimToward(int relRow, int relCol) {
-        // 0=NoMove,1=North,2=East,3=South,4=West
-        // Example approach: pick whichever axis is bigger
-        // If row offset is bigger, move up/down; else left/right
-        int absRow = Math.abs(relRow);
-        int absCol = Math.abs(relCol);
-        if (absRow > absCol) {
-            // move vertically
-            return (relRow < 0) ? 1 : 3; // north or south
-        } else if (absCol > 0) {
-            // move horizontally
-            return (relCol < 0) ? 4 : 2; // west or east
-        } else {
-            // Already aligned => no move
-            return 0;
-        }
-    }
-
-    private int randomMoveLim() {
-        // 0=stay,1=North,2=East,3=South,4=West
-        return (int)(Math.random() * 5);
+    private int manhattanDistance(int r1, int c1, int r2, int c2) {
+        return Math.abs(r1 - r2) + Math.abs(c1 - c2);
     }
 }
